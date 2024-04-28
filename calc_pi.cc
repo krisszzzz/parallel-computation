@@ -10,14 +10,9 @@
 // No CRTP needed now, we can use deducing this now
 class PiCalcIface {
 public:
-  PiCalcIface(boost::mpi::communicator &comm_ref) : comm_ref_(comm_ref){};
-  template <typename Self> auto &&getCommunicator(this Self &&self) {
-    return self.comm_ref_;
-  }
-
   template <typename Self>
   double calculatePi(this Self &&self, int num_of_terms) {
-    return self.calculatePi(num_of_terms);
+    return self.calculatePiImpl(num_of_terms);
   }
 
 protected:
@@ -29,27 +24,30 @@ protected:
     }
     return 4 * sum;
   }
-
-private:
-  boost::mpi::communicator &comm_ref_;
 };
 
 class PiCalcSeq : public PiCalcIface {
 public:
-  double calculatePi(int num_of_terms) const {
+  friend class PiCalcIface;
+
+private:
+  double calculatePiImpl(int num_of_terms) const {
     double sum = 0.0;
-    if (getCommunicator().rank() == 0) {
-      sum = calculatePiPartial(0, num_of_terms);
-    }
-    // wait for all processes
-    getCommunicator().barrier();
+    sum = calculatePiPartial(0, num_of_terms);
     return sum;
   }
 };
 
 class PiCalcParallel : public PiCalcIface {
 public:
-  double calculatePi(int num_of_terms) const {
+  friend class PiCalcIface;
+  template <typename Self> auto &&getCommunicator(this Self &&self) {
+    return std::forward<Self>(self).comm_ref_;
+  }
+  PiCalcParallel(boost::mpi::communicator &comm_ref) : comm_ref_(comm_ref){};
+
+private:
+  double calculatePiImpl(int num_of_terms) const {
     constexpr int tag = 0;
     int terms_per_proc = num_of_terms / getCommunicator().size();
     double sum = 0.0;
@@ -73,13 +71,14 @@ public:
   }
 
 private:
+  boost::mpi::communicator &comm_ref_;
 };
 
 int main(int argc, char *argv[]) {
   boost::mpi::environment env{argc, argv};
   boost::mpi::communicator world;
 
-  PiCalcSeq pi_seq{world};
+  PiCalcSeq pi_seq{};
   PiCalcParallel pi_par{world};
 
   int curr_rank = world.rank();
@@ -91,13 +90,19 @@ int main(int argc, char *argv[]) {
     double result = 0.0;
     boost::mpi::timer time;
     double begin = time.elapsed();
+
     for (int i = 0; i < test_count; i++) {
-      result = impl.calculatePi(num_of_terms);
+      if constexpr (std::is_same_v<std::decay_t<decltype(impl)>, PiCalcSeq>) {
+        if (curr_rank == 0)
+          result = impl.calculatePi(num_of_terms);
+      } else {
+        result = impl.calculatePi(num_of_terms);
+      }
     }
 
     double passed_time = time.elapsed() - begin;
 
-    // output only once
+    // the counted result in the process with rank == 0
     if (curr_rank == 0) {
       std::cout
           << std::format(
